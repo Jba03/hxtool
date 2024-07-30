@@ -1,0 +1,12 @@
+*.txt
+*.cfg
+*.cmake
+*.xcodeproj
+
+Makefile
+CMakeFiles
+CMakeScripts
+build
+Debug
+
+hxtool

@@ -1,0 +1,7 @@
+[submodule "imgui"]
+	path = imgui
+	url = https://github.com/ocornut/imgui.git
+	branch = docking
+[submodule "libhx2"]
+	path = libhx2
+	url = https://github.com/Jba03/libhx2.git
