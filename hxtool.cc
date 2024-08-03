@@ -17,6 +17,7 @@
 #include <SDL2/SDL.h>
 
 #include <hx2.h>
+#include <stream.h>
 
 static bool Quit = false;
 static bool WantsQuit = false;
@@ -36,6 +37,7 @@ static hx_t *hx_ctx = nullptr;
 static std::filesystem::path work_directory;
 static std::filesystem::path current_file;
 static std::filesystem::path DroppedFile = "";
+static char* BasePath = nullptr;
 
 static hx_entry* PlayingEvent = nullptr;
 static hx_entry* SelectedEvent = nullptr;
@@ -103,7 +105,7 @@ static void ErrorCB(const char* str, void*) {
 }
 
 static std::string ConfigFile() {
-  std::filesystem::path path = SDL_GetBasePath();
+  std::filesystem::path path = BasePath;
   if (!std::filesystem::exists(path)) std::filesystem::create_directory(path);
   path += "/hxtool.cfg";
   return path.string();
@@ -143,6 +145,16 @@ static std::deque<hx_audio_stream*> AudioQueue;
 static std::deque<hx_audio_stream*> AudioSwapQueue;
 
 static void AudioClear() {
+  for (auto& e : AudioQueue) {
+    hx_audio_stream_dealloc(e);
+    free(e);
+  }
+  
+  for (auto& e : AudioSwapQueue) {
+    hx_audio_stream_dealloc(e);
+    free(e);
+  }
+  
   AudioLength = 0;
   AudioPositionTotal = 0;
   AudioQueueIndex = 0;
@@ -215,18 +227,24 @@ static void AudioPlay() {
   for (auto enqueued : AudioQueue) {
     /* Decode the stream */
     hx_audio_stream* pcm = enqueued;
-    if (pcm->info.codec != HX_CODEC_PCM) {
+    if (pcm->info.fmt != HX_FORMAT_PCM) {
       pcm = (hx_audio_stream*)malloc(sizeof(*pcm));
+      pcm->info.fmt = HX_FORMAT_PCM;
     }
     
-    switch (enqueued->info.codec) {
-      case HX_CODEC_PCM: break;
-      case HX_CODEC_DSP: dsp_decode(hx_ctx, enqueued, pcm); break;
-      default:
-        Log.push_back({ LogEntry::Type::Error, "failed to load audio stream: unsupported codec " + std::string(hx_codec_name(enqueued->info.codec)) });
-        return;
+    if (hx_audio_convert(enqueued, pcm) < 0) {
+      Log.push_back({ LogEntry::Type::Error, "failed to load audio stream: unsupported codec " + std::string(hx_format_name(enqueued->info.fmt)) });
+      return;
     }
-    
+//
+//    switch (enqueued->info.codec) {
+//      case HX_FORMAT_PCM: break;
+//      case HX_FORMAT_DSP: dsp_decode(hx_ctx, enqueued, pcm); break;
+//      default:
+//        Log.push_back({ LogEntry::Type::Error, "failed to load audio stream: unsupported codec " + std::string(HX_FORMAT_name(enqueued->info.codec)) });
+//        return;
+//    }
+//
     audio.channels = pcm->info.num_channels;
     audio.freq = pcm->info.sample_rate;
     AudioLength += pcm->size;
@@ -253,11 +271,11 @@ static void AudioPlay() {
 static void QueueAudioEntry(hx_entry_t* e) {
   if (e->i_class == HX_CLASS_EVENT_RESOURCE_DATA) {
     hx_event_resource_data_t *data = (hx_event_resource_data_t*)e->data;
-    hx_entry_t *link = hx_context_entry_lookup(hx_ctx, data->link_cuuid);
+    hx_entry_t *link = hx_context_find_entry(hx_ctx, data->link);
     if (link) {
       if (link->i_class == HX_CLASS_WAVE_RESOURCE_DATA) {
         hx_wav_resource_data_t *waveres = (hx_wav_resource_data_t*)link->data;
-        link = hx_context_entry_lookup(hx_ctx, waveres->default_cuuid);
+        link = hx_context_find_entry(hx_ctx, waveres->default_cuuid);
         if (link) {
           hx_wave_file_id_object_t *waveobj = (hx_wave_file_id_object_t*)link->data;
           if (AudioLoad(waveobj->audio_stream)) {
@@ -270,10 +288,10 @@ static void QueueAudioEntry(hx_entry_t* e) {
         if (progres->num_links > 0) {
           bool success = false;
           for (int i = 0; i < progres->num_links; i++) {
-            link = hx_context_entry_lookup(hx_ctx, progres->links[i]);
+            link = hx_context_find_entry(hx_ctx, progres->links[i]);
             if (link) {
               hx_wav_resource_data_t *waveres = (hx_wav_resource_data_t*)link->data;
-              link = hx_context_entry_lookup(hx_ctx, waveres->default_cuuid);
+              link = hx_context_find_entry(hx_ctx, waveres->default_cuuid);
               if (link) {
                 hx_wave_file_id_object_t *waveobj = (hx_wave_file_id_object_t*)link->data;
                 success |= AudioLoad(waveobj->audio_stream);
@@ -529,14 +547,14 @@ static void EntryTableTree(hx_entry_t* root, int depth, std::string info = "--")
     
     if (root->i_class == HX_CLASS_EVENT_RESOURCE_DATA) {
       hx_event_resource_data_t *data = static_cast<hx_event_resource_data_t*>(root->data);
-      next.push_back(hx_context_entry_lookup(hx_ctx, data->link_cuuid));
+      next.push_back(hx_context_find_entry(hx_ctx, data->link));
     }
     
     if (root->i_class == HX_CLASS_WAVE_RESOURCE_DATA) {
       hx_wav_resource_data_t *data = static_cast<hx_wav_resource_data_t*>(root->data);
-      if (data->default_cuuid) next.push_back(hx_context_entry_lookup(hx_ctx, data->default_cuuid));
+      if (data->default_cuuid) next.push_back(hx_context_find_entry(hx_ctx, data->default_cuuid));
       for (unsigned int i = 0; i < data->num_links; i++) {
-        next.push_back(hx_context_entry_lookup(hx_ctx, data->links[i].cuuid));
+        next.push_back(hx_context_find_entry(hx_ctx, data->links[i].cuuid));
         switch(HX_BYTESWAP32(data->links[i].language)) {
           case HX_LANGUAGE_DE: info_v.push_back("DE"); break;
           case HX_LANGUAGE_EN: info_v.push_back("EN"); break;
@@ -551,7 +569,7 @@ static void EntryTableTree(hx_entry_t* root, int depth, std::string info = "--")
     if (root->i_class == HX_CLASS_PROGRAM_RESOURCE_DATA) {
       hx_program_resource_data_t *data = static_cast<hx_program_resource_data_t*>(root->data);
       for (unsigned int i = 0; i < data->num_links; i++) {
-        next.push_back(hx_context_entry_lookup(hx_ctx, data->links[i]));
+        next.push_back(hx_context_find_entry(hx_ctx, data->links[i]));
       }
     }
     
@@ -568,7 +586,7 @@ static void EntryTableTree(hx_entry_t* root, int depth, std::string info = "--")
   ImGui::TextDisabled(info.c_str());
   
   ImGui::TableNextColumn();
-  hx_class_to_string(hx_ctx, root->i_class, out, nullptr);
+  hx_class_name(root->i_class, hx_context_version(hx_ctx), out, HX_STRING_MAX_LENGTH);
   
   ImGui::TextDisabled(out);
   
@@ -612,7 +630,7 @@ static int ReplaceWaveFile(hx_wave_file_id_object_t *data, std::filesystem::path
     return -1;
   }
   
-  hx_codec wanted_codec = data->audio_stream->info.codec;
+  enum hx_format wanted_format = data->audio_stream->info.fmt;
   
   
   if (SDL_AUDIO_BITSIZE(spec.format) != 16) {
@@ -630,23 +648,28 @@ static int ReplaceWaveFile(hx_wave_file_id_object_t *data, std::filesystem::path
   hx_audio_stream_t pcm;
   pcm.size = sz;
   pcm.data = (short*)buf;
-  pcm.info.codec = HX_CODEC_PCM;
+  pcm.info.fmt = HX_FORMAT_PCM;
   pcm.info.sample_rate = spec.freq;
   pcm.info.num_channels = spec.channels;
   pcm.info.endianness = spec.format & SDL_AUDIO_MASK_ENDIAN;
   pcm.info.num_samples = (sz / (pcm.info.num_channels * sizeof(short)));  //spec.samples * spec.freq; //(pcm.size / data->wave_header.block_alignment) / pcm.info.num_channels;;
   
-  Log.push_back({ LogEntry::Type::Info, "Encoding " + file.filename().string() + " (" + hx_codec_name(pcm.info.codec) + " -> " + hx_codec_name(wanted_codec) + ")" });
+  Log.push_back({ LogEntry::Type::Info, "Encoding " + file.filename().string() + " (" + hx_format_name(pcm.info.fmt) + " -> " + hx_format_name(wanted_format) + ")" });
   
-  switch (wanted_codec) {
-    case HX_CODEC_PCM:
-      *data->audio_stream = pcm;
-      break;
-    case HX_CODEC_DSP:
-      dsp_encode(hx_ctx, &pcm, data->audio_stream);
-      break;
-    default:
-      break;
+//  switch (wanted_codec) {
+//    case HX_FORMAT_PCM:
+//      *data->audio_stream = pcm;
+//      break;
+//    case HX_FORMAT_DSP:
+//      dsp_encode(hx_ctx, &pcm, data->audio_stream);
+//      break;
+//    default:
+//      break;
+//  }
+  
+  if (hx_audio_convert(&pcm, data->audio_stream) < 0) {
+    Log.push_back({ LogEntry::Type::Error, "Failed to convert audio stream: unsupported formats" });
+    return;
   }
   
   SDL_free(buf);
@@ -659,7 +682,7 @@ static void DrawObjectWindow() {
     snprintf(name, HX_STRING_MAX_LENGTH, "%016llX\n", SelectedObject->cuuid);
     ImGui::Text("%s", name);
     
-    hx_class_to_string(hx_ctx, SelectedObject->i_class, name, nullptr);
+    hx_class_name(SelectedObject->i_class, hx_context_version(hx_ctx), name, HX_STRING_MAX_LENGTH);
     ImGui::TextDisabled("%s @ %X\n", name, SelectedObject->file_offset);
     
     ImGui::Separator();
@@ -668,19 +691,19 @@ static void DrawObjectWindow() {
     if (SelectedObject->i_class == HX_CLASS_EVENT_RESOURCE_DATA) {
       hx_event_resource_data_t *data = static_cast<hx_event_resource_data_t*>(SelectedObject->data);
       ImGui::InputText("Name", data->name, HX_STRING_MAX_LENGTH);
-      ImGui::InputFloat("C0", &data->f_param[0]);
-      ImGui::InputFloat("C1", &data->f_param[1]);
-      ImGui::InputFloat("C2", &data->f_param[2]);
-      ImGui::InputFloat("C3", &data->f_param[3]);
+      ImGui::InputFloat("C0", &data->c[0]);
+      ImGui::InputFloat("C1", &data->c[1]);
+      ImGui::InputFloat("C2", &data->c[2]);
+      ImGui::InputFloat("C3", &data->c[3]);
     } else if (SelectedObject->i_class == HX_CLASS_WAVE_RESOURCE_DATA) {
       hx_wav_resource_data_t *data = static_cast<hx_wav_resource_data_t*>(SelectedObject->data);
       ImGui::InputScalar("Flags", ImGuiDataType_S8, &data->res_data.flags);
-      ImGui::InputFloat("C0", &data->res_data.c0);
-      ImGui::InputFloat("C1", &data->res_data.c1);
-      ImGui::InputFloat("C2", &data->res_data.c2);
+      ImGui::InputFloat("C0", &data->res_data.c[0]);
+      ImGui::InputFloat("C1", &data->res_data.c[1]);
+      ImGui::InputFloat("C2", &data->res_data.c[2]);
     } else if (SelectedObject->i_class == HX_CLASS_WAVE_FILE_ID_OBJECT) {
       hx_wave_file_id_object_t *data = static_cast<hx_wave_file_id_object_t*>(SelectedObject->data);
-      ImGui::TextDisabled("%s, (%d) ch %s", data->ext_stream_size==0 ? "Internal" : "External", data->audio_stream->info.num_channels, hx_codec_name(data->audio_stream->info.codec));
+      ImGui::TextDisabled("%s, (%d) ch %s", data->ext_stream_size==0 ? "Internal" : "External", data->audio_stream->info.num_channels, hx_format_name(data->audio_stream->info.fmt));
       ImGui::TextDisabled("Size: %d bytes", hx_audio_stream_size(data->audio_stream));
       
       if (data->ext_stream_size>0) {
@@ -714,61 +737,56 @@ static void DrawObjectWindow() {
 }
 
 static void DrawEntries() {
-  int num_entries = 0;
-  hx_entry_t* entries = nullptr;
-  hx_context_get_entries(hx_ctx, &entries, &num_entries);
-  
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4,4));
   ImGui::Begin("Events", NULL, ImGuiWindowFlags_NoDecoration & ~ImGuiWindowFlags_NoScrollbar);
   ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(2,1));
-    
-    if (entries) {
-      if (ImGui::BeginTable("table", 2, ImGuiTableFlags_SizingFixedFit)) {
-        
-        for (int i = 0; i < num_entries; i++) {
-          hx_entry_t *entry = entries + i;
-          if (entry->i_class == HX_CLASS_EVENT_RESOURCE_DATA) {
-            hx_event_resource_data_t *data = (hx_event_resource_data_t*)entry->data;
-            
-            ImVec4 color = (i == SelectedEntryIndex) ? ImVec4(1.0f, 0.7f, 0.4f, 1.0f) : EntryColor(entry);
-            ImGui::PushStyleColor(ImGuiCol_Text, color);
-            ImGui::TableNextColumn();
-            
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY()-1);
-            
-            if (DrawPlayButton(i, AudioPositionTotal != 0 && PlayingEvent == entry && SDL_GetAudioStatus() == SDL_AUDIO_PLAYING)) {
-              if (PlayingEvent && PlayingEvent == entry && SDL_GetAudioStatus() == SDL_AUDIO_PLAYING) {
-                AudioClear();
-                PlayingEvent = nullptr;
-                SDL_CloseAudio();
-              } else {
-                QueueAudioEntry(entry);
-              }
+  
+  if (hx_ctx) {
+    if (ImGui::BeginTable("table", 2, ImGuiTableFlags_SizingFixedFit)) {
+      for (hx_size_t i = 0; i < hx_context_num_entries(hx_ctx); i++) {
+        hx_entry_t *entry = hx_context_get_entry(hx_ctx, i);
+        if (entry->i_class == HX_CLASS_EVENT_RESOURCE_DATA) {
+          hx_event_resource_data_t *data = (hx_event_resource_data_t*)entry->data;
+          
+          ImVec4 color = (i == SelectedEntryIndex) ? ImVec4(1.0f, 0.7f, 0.4f, 1.0f) : EntryColor(entry);
+          ImGui::PushStyleColor(ImGuiCol_Text, color);
+          ImGui::TableNextColumn();
+          
+          ImGui::SetCursorPosY(ImGui::GetCursorPosY()-1);
+          
+          if (DrawPlayButton(i, AudioPositionTotal != 0 && PlayingEvent == entry && SDL_GetAudioStatus() == SDL_AUDIO_PLAYING)) {
+            if (PlayingEvent && PlayingEvent == entry && SDL_GetAudioStatus() == SDL_AUDIO_PLAYING) {
+              AudioClear();
+              PlayingEvent = nullptr;
+              SDL_CloseAudio();
+            } else {
+              QueueAudioEntry(entry);
             }
-            
-            ImGui::TableNextColumn();
-            
-            if (ImGui::Selectable(data->name, SelectedEntryIndex == i)) {
-              if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                printf("left\n");
-              }
-              
-              
-              SelectedEvent = entry;
-              SelectedEntryIndex = i;
-            }
-            
-            
-            ImGui::PopStyleColor();
           }
+          
+          ImGui::TableNextColumn();
+          
+          if (ImGui::Selectable(data->name, SelectedEntryIndex == i)) {
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+              printf("left\n");
+            }
+            
+            
+            SelectedEvent = entry;
+            SelectedEntryIndex = i;
+          }
+          
+          
+          ImGui::PopStyleColor();
         }
-        
-        ImGui::EndTable();
       }
+      
+      ImGui::EndTable();
     }
-    
-    ImGui::PopStyleVar(2);
-    ImGui::End();
+  }
+  
+  ImGui::PopStyleVar(2);
+  ImGui::End();
 }
 
 static size_t LastLogNumEntries = 0;
@@ -949,11 +967,7 @@ static void LoadHXFile(std::filesystem::path path) {
     Log.push_back({ LogEntry::Type::Status, "Loaded " + path.filename().string() + " in " +
       std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count() / 1'000'000'000.0f) + " seconds." });
     
-    int num_entries = 0;
-    hx_entry_t* entries = nullptr;
-    hx_context_get_entries(hx_ctx, &entries, &num_entries);
-    
-    SelectedEvent = entries;
+    SelectedEvent = hx_context_get_entry(hx_ctx, 0);
     
     SDL_SetWindowTitle(Window, ("hxtool - " + current_file.string()).c_str());
     
@@ -1002,6 +1016,8 @@ int main(int argc, char** argv) {
   Renderer = SDL_CreateRenderer(Window, -1, SDL_RENDERER_PRESENTVSYNC);
   SDL_SetWindowMinimumSize(Window, W, H);
   
+  BasePath = SDL_GetBasePath();
+  
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   
@@ -1032,6 +1048,7 @@ int main(int argc, char** argv) {
   }
   
   SaveConfig();
+  SDL_free(BasePath);
   
   ImGui_ImplSDLRenderer2_Shutdown();
   ImGui_ImplSDL2_Shutdown();
